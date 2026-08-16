@@ -122,7 +122,15 @@ class BTMResultFormatter:
     """
 
     def format_kiosk(self, report: AnalysisReport, narrative: HealthNarrative) -> Dict:
-        """Minimal — what fits on a public kiosk screen in a few seconds."""
+        """Minimal — what fits on a public kiosk screen in a few seconds.
+
+        The BTM is used one patient at a time, so this view is private to
+        whoever is at the device right now — that's what makes it safe to
+        carry the consent-flow fields at all. requires_consent_flow /
+        reactive_markers / sensitive_narrative are never folded into
+        headline/summary/disclaimer above; they're kept as their own
+        fields so btm_ui.py can render them as a separate, deliberately
+        shown private card rather than mixed into the general screen."""
         chi = report.health_index
         return {
             "headline"          : narrative.headline,
@@ -133,6 +141,9 @@ class BTMResultFormatter:
             "follow_up_actions" : narrative.follow_up_actions[:3],
             "genotype_note"     : self._genotype_kiosk_note(report.haemoglobinopathy),
             "disclaimer"        : narrative.disclaimer,
+            "requires_consent_flow" : narrative.requires_consent_flow,
+            "reactive_markers"      : narrative.reactive_markers,
+            "sensitive_narrative"   : narrative.sensitive_narrative,
         }
 
     def format_phone(self, report: AnalysisReport, narrative: HealthNarrative) -> Dict:
@@ -156,6 +167,9 @@ class BTMResultFormatter:
             "model_used"         : narrative.model_used,
             "generated_at"       : narrative.generated_at,
             "disclaimer"         : narrative.disclaimer,
+            "requires_consent_flow" : narrative.requires_consent_flow,
+            "reactive_markers"      : narrative.reactive_markers,
+            "sensitive_narrative"   : narrative.sensitive_narrative,
         }
 
     def format_web(self, report: AnalysisReport, narrative: HealthNarrative) -> Dict:

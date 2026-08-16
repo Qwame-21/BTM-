@@ -20,9 +20,28 @@ Session loop (run_session()):
     collection → analysis → AI interpretation → results delivery →
     helix returns used material → bin updated → post-test hygiene
 
+Consent capture (see btm_consent.py):
+    When a result's HealthNarrative.requires_consent_flow is True, the
+    UI needs to show a private prompt and capture the patient's
+    accept/decline decision — but that happens on a separate UI
+    interaction, after complete_session() has already returned. The
+    narrative itself isn't retained anywhere past that point by
+    default (complete_session() only hands the UI a plain kiosk_view
+    dict via on_results), so this file keeps a short-lived
+    session_id → HealthNarrative cache (_narrative_cache,
+    NARRATIVE_CACHE_TTL_S) populated the moment a narrative is
+    computed. btm_ui.py should call submit_consent(session_id,
+    decision) once the patient responds — get_narrative() is exposed
+    for the UI to read requires_consent_flow/reactive_markers/
+    sensitive_narrative if needed. Entries older than the TTL are
+    evicted opportunistically (patient walked away without deciding).
+
 Background loops:
-    Connectivity — periodic btm_results.sync_pending() to flush the
-                  offline buffer once connectivity returns (HOME/NETWORK)
+    Connectivity — periodic btm_results.sync_pending() AND
+                  btm_consent.sync_pending() to flush both offline
+                  buffers once connectivity returns (HOME/NETWORK) —
+                  these are deliberately separate buffer files, see
+                  btm_consent.py's module docstring
     Maintenance  — periodic evaluate_and_dispatch() + check_escalations()
 
 Graceful shutdown on SIGTERM/SIGINT: stops background loops, stops the
@@ -48,15 +67,16 @@ import signal
 import sys
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import config
 from btm_bus import bus
 from btm_auth import BTMAuthManager, AuthMethod, AuthStatus
 from btm_sample import BTMSampleCollector, DeploymentContext, DeploymentMode, Hand, Finger
 from btm_analysis import BTMAnalysisEngine, Sex
-from btm_ai_interpreter import BTMAIInterpreter
+from btm_ai_interpreter import BTMAIInterpreter, HealthNarrative
 from btm_results import BTMResultsEngine
+from btm_consent import ConsentCaptureEngine, ConsentDecision, ConsentOutcome
 from btm_helix import BTMHelix
 from btm_bin import BTMBin, ConsumableType
 from btm_hygiene import BTMHygieneManager
@@ -73,6 +93,11 @@ log = logging.getLogger("run_btm")
 
 CONNECTIVITY_CHECK_INTERVAL_S = 60.0
 MAINTENANCE_CHECK_INTERVAL_S  = 300.0
+NARRATIVE_CACHE_TTL_S         = 900.0   # 15 min — long enough for a patient
+                                          # to read results and decide on the
+                                          # consent prompt; short enough not
+                                          # to accumulate indefinitely if
+                                          # they walk away without deciding.
 
 # Simulation-only demographic lookup — see module docstring. Keys match
 # btm_auth._SIMULATED_REGISTRY exactly.
@@ -108,6 +133,17 @@ class BTMRuntime:
         self._analysis_engine = BTMAnalysisEngine(hw_simulation=config.HW_SIMULATION_MODE)
         self._interpreter = BTMAIInterpreter()
         self._results_engine = BTMResultsEngine(self._deployment)
+        self._consent_engine = ConsentCaptureEngine(self._deployment)
+
+        # Short-lived session_id → HealthNarrative cache for the consent
+        # window — see module docstring "Consent capture" section for why
+        # this exists. Guarded by its own lock since it's written from the
+        # background session thread (_run_collection → complete_session)
+        # and read/consumed from whatever thread handles the UI's consent
+        # decision (a Flask request thread, in btm_ui.py).
+        self._narrative_cache: Dict[str, Tuple[HealthNarrative, float]] = {}
+        self._narrative_cache_lock = threading.Lock()
+
         self._helix = BTMHelix()
         self._bin = BTMBin()
         self._hygiene = BTMHygieneManager(device_id=self._deployment.device_id)
@@ -196,6 +232,9 @@ class BTMRuntime:
         while not self._shutdown_event.is_set():
             try:
                 synced = self._results_engine.sync_pending()
+                referrals_synced = self._consent_engine.sync_pending()
+                if referrals_synced:
+                    log.info("Synced %d buffered referral(s)", referrals_synced)
                 if synced:
                     log.info("Connectivity loop: synced %d buffered result(s)", synced)
             except Exception as e:
@@ -290,6 +329,7 @@ class BTMRuntime:
             report = self._analysis_engine.analyse(collection, sex=sex, age=age)
 
             narrative = self._interpreter.interpret(report)
+            self._cache_narrative(narrative)
 
             package = self._results_engine.deliver(report, narrative)
             log.info("Results delivered | status=%s | destination=%s",
@@ -325,6 +365,45 @@ class BTMRuntime:
 
         finally:
             self._auth.end_session(session_id)
+
+    # ── Consent capture (see module docstring "Consent capture") ──
+
+    def _cache_narrative(self, narrative: HealthNarrative) -> None:
+        now = time.time()
+        with self._narrative_cache_lock:
+            self._narrative_cache[narrative.session_id] = (narrative, now)
+            # Opportunistic cleanup — no dedicated background thread just
+            # for this; piggybacks on every new insert instead.
+            stale = [sid for sid, (_, ts) in self._narrative_cache.items()
+                     if now - ts > NARRATIVE_CACHE_TTL_S]
+            for sid in stale:
+                del self._narrative_cache[sid]
+
+    def get_narrative(self, session_id: str) -> Optional[HealthNarrative]:
+        """For the UI to read requires_consent_flow/reactive_markers/
+        sensitive_narrative if it needs the full narrative rather than
+        just the kiosk_view dict already in result_summary."""
+        with self._narrative_cache_lock:
+            entry = self._narrative_cache.get(session_id)
+            return entry[0] if entry else None
+
+    def submit_consent(self, session_id: str, decision: ConsentDecision) -> Optional[ConsentOutcome]:
+        """
+        Called by the UI layer once the patient responds to the consent
+        prompt. Returns None (not an exception) if the session's
+        narrative is no longer cached — expired, already submitted, or
+        never required consent in the first place; the UI should treat
+        that as "nothing to do" rather than an error.
+        """
+        narrative = self.get_narrative(session_id)
+        if narrative is None:
+            log.warning("submit_consent called for unknown/expired session=%s", session_id)
+            return None
+
+        outcome = self._consent_engine.capture(narrative, decision)
+        with self._narrative_cache_lock:
+            self._narrative_cache.pop(session_id, None)
+        return outcome
 
     def run_session(self, credential: str, method: AuthMethod = AuthMethod.AID_CARD,
                     hand: Hand = Hand.RIGHT, finger: Finger = Finger.INDEX) -> bool:

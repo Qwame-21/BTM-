@@ -8,8 +8,25 @@ session, since there's only ever one active user at the touchscreen.
 
 Screens:
     WELCOME → CARD_SCAN → HAND_SELECTION → COLLECTING → PROCESSING →
-    RESULTS → INFOBOX_CONFIRMATION → GOODBYE (→ back to WELCOME)
+    RESULTS → [CONSENT_PROMPT if result_summary.requires_consent_flow]
+    → INFOBOX_CONFIRMATION → GOODBYE (→ back to WELCOME)
     (ERROR can be reached from CARD_SCAN or COLLECTING on failure)
+
+CONSENT_PROMPT: a private, single-user screen (the device only ever
+serves one person at a time, same assumption the rest of this UI
+already makes) shown only when the delivered result's
+requires_consent_flow is True — see btm_ai_interpreter.py /
+btm_consent.py. Shows the pre-reviewed sensitive_narrative and
+captures Yes/Not-now via runtime.submit_consent(), which only exists
+for the ~15-minute window run_btm.py caches the narrative for (see
+NARRATIVE_CACHE_TTL_S) — submit_consent() degrades gracefully
+(consent_outcome with a null referral_code) rather than erroring if
+that window has passed.
+Universal, non-conditional support resources (a generic "confidential
+support is always available" line) are shown on the RESULTS screen to
+EVERY patient regardless of result — never only when
+requires_consent_flow is True, which would itself leak signal about
+what the result was. Do not make that line conditional.
 
 Flow:
     1. Card scan submits a credential — calls runtime.authenticate().
@@ -52,6 +69,7 @@ from flask import Flask, jsonify, request, render_template_string
 import config
 from btm_auth import AuthMethod, AuthStatus
 from btm_sample import Hand, Finger
+from btm_consent import ConsentDecision
 from run_btm import BTMRuntime
 
 log = logging.getLogger("btm_ui")
@@ -74,6 +92,7 @@ class KioskStage(Enum):
     COLLECTING           = "COLLECTING"
     PROCESSING           = "PROCESSING"
     RESULTS              = "RESULTS"
+    CONSENT_PROMPT       = "CONSENT_PROMPT"
     INFOBOX_CONFIRMATION = "INFOBOX_CONFIRMATION"
     GOODBYE              = "GOODBYE"
     ERROR                = "ERROR"
@@ -93,6 +112,10 @@ class KioskSessionState:
     collection_message  : str = ""
     error_message        : Optional[str] = None
     result_summary        : Optional[Dict] = None
+    consent_outcome         : Optional[Dict] = None   # set once submit_consent()
+                                                        # has been called for this
+                                                        # session — None means
+                                                        # "not yet decided"
     updated_at              : str = field(default_factory=_now_iso)
 
     def to_dict(self) -> Dict:
@@ -105,6 +128,7 @@ class KioskSessionState:
             "collection_message" : self.collection_message,
             "error_message"      : self.error_message,
             "result_summary"     : self.result_summary,
+            "consent_outcome"    : self.consent_outcome,
             "updated_at"         : self.updated_at,
             "simulation_mode"    : config.HW_SIMULATION_MODE,
         }
@@ -142,7 +166,8 @@ class BTMKioskController:
         self._pending_auth = None
         self._update(stage=KioskStage.CARD_SCAN, error_message=None,
                      display_name=None, card_id=None, session_id=None,
-                     result_summary=None, collection_status=None, collection_message="")
+                     result_summary=None, consent_outcome=None,
+                     collection_status=None, collection_message="")
         return self.get_state()
 
     def scan_card(self, credential: str, method: AuthMethod = AuthMethod.AID_CARD) -> Dict:
@@ -187,10 +212,54 @@ class BTMKioskController:
         threading.Timer(GOODBYE_AUTO_RESET_S, self.start_card_scan).start()
         return self.get_state()
 
+    def go_to_consent(self) -> Dict:
+        """Called when the patient taps 'Done' on RESULTS. If this
+        result didn't require the consent flow, there's nothing to
+        show — proceed exactly as before rather than stranding the UI
+        on an empty screen."""
+        with self._lock:
+            requires = bool(self._state.result_summary
+                            and self._state.result_summary.get("requires_consent_flow"))
+        if not requires:
+            return self.confirm_infobox()
+        self._update(stage=KioskStage.CONSENT_PROMPT, consent_outcome=None)
+        return self.get_state()
+
+    def submit_consent(self, decision_str: str) -> Dict:
+        """Captures the patient's Yes/Not-now decision. Degrades
+        gracefully (a consent_outcome with a null referral_code, not an
+        exception) if the runtime's narrative cache has already expired
+        for this session — see NARRATIVE_CACHE_TTL_S in run_btm.py."""
+        try:
+            decision = ConsentDecision(decision_str)
+        except ValueError:
+            log.warning("submit_consent got invalid decision=%r", decision_str)
+            return self.get_state()
+
+        with self._lock:
+            session_id = self._state.session_id
+
+        outcome = self._runtime.submit_consent(session_id, decision) if session_id else None
+
+        if outcome is None:
+            log.warning("Consent window expired or unknown session=%s — "
+                       "degrading gracefully.", session_id)
+            self._update(consent_outcome={
+                "decision": decision.value, "referral_code": None, "delivery_status": None,
+            })
+        else:
+            self._update(consent_outcome={
+                "decision"       : outcome.decision.value,
+                "referral_code"  : outcome.referral_code,
+                "delivery_status": outcome.delivery_status,
+            })
+        return self.get_state()
+
     def go_home(self) -> Dict:
         self._pending_auth = None
         self._update(stage=KioskStage.WELCOME, error_message=None, display_name=None,
                      card_id=None, session_id=None, result_summary=None,
+                     consent_outcome=None,
                      collection_status=None, collection_message="")
         return self.get_state()
 
@@ -391,7 +460,40 @@ function render(state) {
         ${s.genotype_note ? `<p style="color:#e8b84f; font-size:14px; margin-top:12px;">${s.genotype_note}</p>` : ""}
         <p style="color:#5a6b7d; font-size:12px; margin-top:16px;">${s.disclaimer || ""}</p>
       </div>
-      <button class="btn" onclick="confirmInfobox()">Done</button>`;
+      <p class="sub" style="font-size:13px; margin-bottom:16px;">Need someone to talk to? Confidential support is always available through the Aid Plus app.</p>
+      <button class="btn" onclick="${s.requires_consent_flow ? "goToConsent()" : "confirmInfobox()"}">Done</button>`;
+
+  } else if (stage === "CONSENT_PROMPT") {
+    const s = state.result_summary || {};
+    const outcome = state.consent_outcome;
+    if (!outcome) {
+      el.innerHTML = `
+        <h2>A private note</h2>
+        <div class="result-card">
+          <p class="sub">${s.sensitive_narrative || ""}</p>
+          <p style="margin-top:16px; font-weight:600;">Would you like confidential support?</p>
+        </div>
+        <button class="btn" onclick="submitConsent('ACCEPTED')">Yes, I'd like support</button>
+        <button class="btn secondary" onclick="submitConsent('DECLINED')">Not right now</button>`;
+    } else if (outcome.referral_code) {
+      el.innerHTML = `
+        <h2>Your referral code</h2>
+        <div class="result-card">
+          <p style="font-size:24px; font-weight:700; letter-spacing:2px;">${outcome.referral_code}</p>
+          <p class="sub" style="margin-top:12px;">Present this at Aid Plus Health Centre for confidential follow-up. This code is private to you.</p>
+        </div>
+        <button class="btn" onclick="confirmInfobox()">Continue</button>`;
+    } else if (outcome.decision === "DECLINED") {
+      el.innerHTML = `
+        <h2>That's okay</h2>
+        <p class="sub">Support is always available whenever you're ready — through the Aid Plus app.</p>
+        <button class="btn" onclick="confirmInfobox()">Continue</button>`;
+    } else {
+      el.innerHTML = `
+        <h2>We couldn't process that just now</h2>
+        <p class="sub">Please ask a technician for help, or check your Infobox shortly — your results are already saved.</p>
+        <button class="btn" onclick="confirmInfobox()">Continue</button>`;
+    }
 
   } else if (stage === "INFOBOX_CONFIRMATION") {
     el.innerHTML = `
@@ -416,6 +518,8 @@ async function beginScan() { render(await post("/api/start_scan")); poll(); }
 async function scanCard(cardId) { render(await post("/api/scan_card", {credential: cardId})); }
 async function selectHand(hand, finger) { render(await post("/api/select_hand", {hand: hand, finger: finger})); }
 async function confirmInfobox() { render(await post("/api/confirm_infobox")); }
+async function goToConsent() { render(await post("/api/go_to_consent")); }
+async function submitConsent(decision) { render(await post("/api/submit_consent", {decision: decision})); }
 async function goHome() { render(await post("/api/go_home")); }
 
 let lastStage = null;
@@ -479,6 +583,18 @@ def api_select_hand():
 @app.route("/api/confirm_infobox", methods=["POST"])
 def api_confirm_infobox():
     return jsonify(_kiosk.confirm_infobox())
+
+
+@app.route("/api/go_to_consent", methods=["POST"])
+def api_go_to_consent():
+    return jsonify(_kiosk.go_to_consent())
+
+
+@app.route("/api/submit_consent", methods=["POST"])
+def api_submit_consent():
+    data = request.get_json(force=True) or {}
+    decision_str = (data.get("decision") or "").strip()
+    return jsonify(_kiosk.submit_consent(decision_str))
 
 
 @app.route("/api/go_home", methods=["POST"])
