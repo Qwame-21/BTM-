@@ -40,6 +40,7 @@ def _now_iso() -> str:
 
 class ResultType(Enum):
     BLOOD_TEST = "BLOOD_TEST"      # BTM's current (only) result type
+    REFERRAL   = "REFERRAL"        # Referral code delivery to Infobox
     # Kiosk-specific result types (e.g. a dispensing record) to be added
     # here when the Aid System kiosk is retrofitted to this schema.
 
@@ -101,3 +102,17 @@ class InfoboxEntry:
             results      = results,
             session_id   = session_id,
         )
+
+    @classmethod
+    def for_referral(cls, user_card_id: str, referral: Dict,
+                     session_id: Optional[str] = None,
+                     contract_id: str = "BTM-v1") -> "InfoboxEntry":
+        """Convenience factory for referral code delivery to Infobox."""
+        return cls(
+            user_card_id = user_card_id,
+            result_type  = ResultType.REFERRAL,
+            contract_id  = contract_id,
+            results      = referral,
+            session_id   = session_id,
+        )
+
